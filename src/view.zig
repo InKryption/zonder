@@ -82,15 +82,58 @@ pub fn nodeKind(ast: Ast, node: Ast.Node.Index) NodeKindError!NodeKind {
     };
 }
 
+test "null" {
+    const allocator = std.testing.allocator;
+
+    var ast = try Ast.parse(allocator, "null", .zon);
+    defer ast.deinit(allocator);
+
+    const root_expr = rootExpr(ast);
+    try std.testing.expectEqual(.null, nodeKind(ast, root_expr));
+}
+
+test "undefined" {
+    const allocator = std.testing.allocator;
+
+    var ast = try Ast.parse(allocator, "undefined", .zon);
+    defer ast.deinit(allocator);
+
+    const root_expr = rootExpr(ast);
+    try std.testing.expectEqual(.undefined, nodeKind(ast, root_expr));
+}
+
 /// Assumes `nodeKind(ast, node) == .bool`.
 pub fn boolValue(ast: Ast, node: Ast.Node.Index) bool {
-    const main_token = ast.nodes.items(.main_token)[node];
-    const token_slice = ast.tokenSlice(main_token);
-    if (std.mem.eql(u8, "false", token_slice))
-        return false
-    else if (std.mem.eql(u8, "true", token_slice))
-        return true;
+    const src = boolSrc(ast, node);
+    if (std.mem.eql(u8, "false", src)) return false;
+    if (std.mem.eql(u8, "true", src)) return true;
     unreachable;
+}
+
+/// Assumes `nodeKind(ast, node) == .bool`.
+pub inline fn boolSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
+    return ast.tokenSlice(ast.nodes.items(.main_token)[node]);
+}
+
+test "bool" {
+    const allocator = std.testing.allocator;
+
+    {
+        var ast = try Ast.parse(allocator, "true", .zon);
+        defer ast.deinit(allocator);
+
+        const root_expr = rootExpr(ast);
+        try std.testing.expectEqual(.bool, nodeKind(ast, root_expr));
+        try std.testing.expectEqual(true, boolValue(ast, root_expr));
+    }
+    {
+        var ast = try Ast.parse(allocator, "false", .zon);
+        defer ast.deinit(allocator);
+
+        const root_expr = rootExpr(ast);
+        try std.testing.expectEqual(.bool, nodeKind(ast, root_expr));
+        try std.testing.expectEqual(false, boolValue(ast, root_expr));
+    }
 }
 
 /// Assumes `nodeKind(ast, node) == .number`.
@@ -114,6 +157,35 @@ pub fn numberSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
     return ast.getNodeSource(node);
 }
 
+fn testNumberSrc(
+    expected_value: anytype,
+    src: [:0]const u8,
+) !void {
+    var ast = try Ast.parse(std.testing.allocator, src, .zon);
+    defer ast.deinit(std.testing.allocator);
+    return testNumberAst(expected_value, ast, rootExpr(ast));
+}
+fn testNumberAst(expected_value: anytype, ast: Ast, node: Ast.Node.Index) !void {
+    try std.testing.expectEqual(.number, nodeKind(ast, node));
+    const ExpectedType = switch (@typeInfo(@TypeOf(expected_value))) {
+        .ComptimeInt => std.math.IntFittingRange(@min(expected_value, 0), @max(0, expected_value)),
+        .ComptimeFloat => f128,
+        .Int, .Float => @TypeOf(expected_value),
+        else => @compileError("Expected integer or float, got " ++ @typeName(@TypeOf(expected_value))),
+    };
+    try std.testing.expectEqual(expected_value, numberValue(ast, node, ExpectedType));
+}
+
+test "number" {
+    try testNumberSrc(-34_155, "-34_155");
+    try testNumberSrc(34_155, "34_155");
+    try testNumberSrc(421, "4_2_1");
+    try testNumberSrc(2.3, "2.3");
+    try testNumberSrc(2.3e7, "2.3e7");
+    try testNumberSrc(2.3e-8, "2.3e-8");
+    try testNumberSrc(@as(f16, 2.3e-122), "2.3e-122");
+}
+
 /// Assumes `nodeKind(ast, node) == .enumeration`.
 /// Also see `enumerationSrc`.
 pub fn enumerationValue(ast: Ast, node: Ast.Node.Index, comptime E: type) ?E {
@@ -123,8 +195,95 @@ pub fn enumerationValue(ast: Ast, node: Ast.Node.Index, comptime E: type) ?E {
 
 /// Assumes `nodeKind(ast, node) == .enumeration`.
 pub fn enumerationSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
+    assert(nodeKind(ast, node) catch unreachable == .enumeration);
     const nodes_main_token: []const Ast.TokenIndex = ast.nodes.items(.main_token);
     return ast.tokenSlice(nodes_main_token[node]);
+}
+
+fn testEnumerationSrc(expected_value: anytype, src: [:0]const u8) !void {
+    var ast = try Ast.parse(std.testing.allocator, src, .zon);
+    defer ast.deinit(std.testing.allocator);
+    return testEnumerationAst(expected_value, ast, rootExpr(ast));
+}
+fn testEnumerationAst(expected_value: anytype, ast: Ast, node: Ast.Node.Index) !void {
+    try std.testing.expectEqual(.enumeration, nodeKind(ast, node));
+    const expected_str: []const u8, //
+    const already_a_string: bool //
+    = switch (@typeInfo(@TypeOf(expected_value))) {
+        .Enum, .EnumLiteral => .{ @tagName(expected_value), false },
+        .Pointer => .{ expected_value, true },
+        else => @compileError("Expected enum value, enum literal, or string, got " ++ @typeName(@TypeOf(expected_value))),
+    };
+    try std.testing.expectEqualStrings(expected_str, enumerationSrc(ast, node));
+    if (comptime !already_a_string) {
+        const ExpectedType = switch (@typeInfo(@TypeOf(expected_value))) {
+            .Enum => @TypeOf(expected_value),
+            .EnumLiteral => @Type(.{
+                .Enum = .{
+                    // for some reason using u0 here causes a compile error in `stringToEnum`.
+                    .tag_type = u1,
+                    .is_exhaustive = true,
+                    .fields = &.{
+                        .{ .name = @tagName(expected_value), .value = 0 },
+                    },
+                    .decls = &.{},
+                },
+            }),
+            else => unreachable,
+        };
+        try std.testing.expectEqual(expected_value, enumerationValue(ast, node, ExpectedType));
+    }
+}
+
+test "enumeration" {
+    try testEnumerationSrc(.foo, ".foo");
+    try testEnumerationSrc(enum { fizz, buzz, bar }.bar, ".bar");
+    try testEnumerationSrc("baz", ".baz");
+}
+
+/// Assumes `nodeKind(ast, node) == .char`.
+/// Also see `charSrc` & `charSrcQuoted`.
+/// Returns the unicode point value represented by the character literal.
+pub fn charValue(ast: Ast, node: Ast.Node.Index) error{InvalidCharacterLiteral}!u21 {
+    const quoted_src = charSrcQuoted(ast, node);
+    const parsed_char_literal = std.zig.parseCharLiteral(quoted_src);
+    return switch (parsed_char_literal) {
+        .success => |codepoint| codepoint,
+        .failure => error.InvalidCharacterLiteral,
+    };
+}
+
+/// Assumes `nodeKind(ast, node) == .char`.
+pub fn charSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
+    const quoted_src = charSrcQuoted(ast, node);
+    return quoted_src[1 .. quoted_src.len - 1];
+}
+
+/// Assumes `nodeKind(ast, node) == .char`.
+/// Returned string includes the surrounding single quotes.
+pub fn charSrcQuoted(ast: Ast, node: Ast.Node.Index) []const u8 {
+    assert(nodeKind(ast, node) catch unreachable == .char);
+    const nodes_main_token: []const Ast.TokenIndex = ast.nodes.items(.main_token);
+    const token_slice = ast.tokenSlice(nodes_main_token[node]);
+    assert(token_slice.len >= 2);
+    assert('\'' == token_slice[0]);
+    assert('\'' == token_slice[token_slice.len - 1]);
+    return token_slice;
+}
+
+fn testCharSrc(expected_value: u21, src: [:0]const u8) !void {
+    var ast = try Ast.parse(std.testing.allocator, src, .zon);
+    defer ast.deinit(std.testing.allocator);
+    return testCharAst(expected_value, ast, rootExpr(ast));
+}
+fn testCharAst(expected_value: u21, ast: Ast, node: Ast.Node.Index) !void {
+    try std.testing.expectEqual(.char, nodeKind(ast, node));
+    try std.testing.expectEqual(expected_value, charValue(ast, node));
+}
+
+test "char" {
+    try testCharSrc('a', "'a'");
+    try testCharSrc('\u{21}', "'\\u{21}'");
 }
 
 pub const StringView = struct {
@@ -239,119 +398,18 @@ pub const StringView = struct {
     };
 };
 
-test "null" {
-    const allocator = std.testing.allocator;
-
-    var ast = try Ast.parse(allocator, "null", .zon);
-    defer ast.deinit(allocator);
-
-    const root_expr = rootExpr(ast);
-    try std.testing.expectEqual(.null, nodeKind(ast, root_expr));
-}
-
-test "undefined" {
-    const allocator = std.testing.allocator;
-
-    var ast = try Ast.parse(allocator, "undefined", .zon);
-    defer ast.deinit(allocator);
-
-    const root_expr = rootExpr(ast);
-    try std.testing.expectEqual(.undefined, nodeKind(ast, root_expr));
-}
-
-test "bool" {
-    const allocator = std.testing.allocator;
-
-    {
-        var ast = try Ast.parse(allocator, "true", .zon);
-        defer ast.deinit(allocator);
-
-        const root_expr = rootExpr(ast);
-        try std.testing.expectEqual(.bool, nodeKind(ast, root_expr));
-        try std.testing.expectEqual(true, boolValue(ast, root_expr));
-    }
-    {
-        var ast = try Ast.parse(allocator, "false", .zon);
-        defer ast.deinit(allocator);
-
-        const root_expr = rootExpr(ast);
-        try std.testing.expectEqual(.bool, nodeKind(ast, root_expr));
-        try std.testing.expectEqual(false, boolValue(ast, root_expr));
-    }
-}
-
-test "number" {
-    const allocator = std.testing.allocator;
-
-    {
-        var ast = try Ast.parse(allocator, "-0341_55", .zon);
-        defer ast.deinit(allocator);
-
-        const root_expr = rootExpr(ast);
-        try std.testing.expectEqual(.number, nodeKind(ast, root_expr));
-        try std.testing.expectEqualStrings("-0341_55", numberSrc(ast, root_expr));
-    }
-}
-
-test "enumeration" {
-    const allocator = std.testing.allocator;
-
-    var ast = try Ast.parse(allocator, ".foo", .zon);
-    defer ast.deinit(allocator);
-
-    const root_expr = rootExpr(ast);
-    try std.testing.expectEqual(.enumeration, nodeKind(ast, root_expr));
-    try std.testing.expectEqualStrings("foo", enumerationSrc(ast, root_expr));
-}
-
-test StringView {
-    // just to demo the in-source equivalent of multiline string literal newlines:
-    std.testing.expectEqualStrings("foo\nbar",
-        \\foo
-        \\bar
-        // newline is here, but not included in mutliline string
-    ) catch unreachable;
-    std.testing.expectEqualStrings("foo\nbar\n",
-        \\foo
-        \\bar
-        \\
-        // previous newline is included in the multiline string
-    ) catch unreachable;
-
-    try testStringViewSrc(
-        \\ \\foo
-        \\ \\bar
-        \\
-    , &.{ "foo\n", "bar" });
-
-    try testStringViewSrc(
-        \\ \\foo
-        \\ \\bar
-        \\ \\
-        \\
-    , &.{ "foo\n", "bar\n", "" });
-
-    try testStringViewSrc(
-        \\"foo bar"
-    , &.{"foo bar"});
-
-    try testStringViewSrc(
-        \\"foo\nbar"
-    , &.{"foo\\nbar"});
-}
-
 fn testStringViewSrc(
-    src: [:0]const u8,
     expected_segments: []const []const u8,
+    src: [:0]const u8,
 ) !void {
     var ast = try Ast.parse(std.testing.allocator, src, .zon);
     defer ast.deinit(std.testing.allocator);
-    return testStringViewAst(ast, rootExpr(ast), expected_segments);
+    return testStringViewAst(expected_segments, ast, rootExpr(ast));
 }
 fn testStringViewAst(
+    expected_segments: []const []const u8,
     ast: Ast,
     node: Ast.Node.Index,
-    expected_segments: []const []const u8,
 ) !void {
     try std.testing.expectEqual(.string, nodeKind(ast, node));
 
@@ -387,6 +445,42 @@ fn testStringViewAst(
     }
 
     try std.testing.expectEqualStrings(expected_str.items, actual_str.items);
+}
+
+test StringView {
+    // just to demo the in-source equivalent of multiline string literal newlines:
+    std.testing.expectEqualStrings("foo\nbar",
+        \\foo
+        \\bar
+        // newline is here, but not included in mutliline string
+    ) catch unreachable;
+    std.testing.expectEqualStrings("foo\nbar\n",
+        \\foo
+        \\bar
+        \\
+        // previous newline is included in the multiline string
+    ) catch unreachable;
+
+    try testStringViewSrc(&.{ "foo\n", "bar" },
+        \\ \\foo
+        \\ \\bar
+        \\
+    );
+
+    try testStringViewSrc(&.{ "foo\n", "bar\n", "" },
+        \\ \\foo
+        \\ \\bar
+        \\ \\
+        \\
+    );
+
+    try testStringViewSrc(&.{"foo bar"},
+        \\"foo bar"
+    );
+
+    try testStringViewSrc(&.{"foo\\nbar"},
+        \\"foo\nbar"
+    );
 }
 
 fn testPrint(comptime fmt: []const u8, args: anytype) void {
