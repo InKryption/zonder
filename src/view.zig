@@ -11,6 +11,7 @@ pub fn rootExpr(ast: Ast) Ast.Node.Index {
 pub const NodeKind = enum {
     bool,
     char,
+    empty_tuple,
     enumeration,
     err,
     list,
@@ -26,26 +27,46 @@ pub const NodeKindError = error{
     UnrecognizedIdentifier,
     NonZonNodeTag,
     NonEmptyVoidBlock,
+    TypedArrayInit,
+    TypedStructInit,
 };
 pub fn nodeKind(ast: Ast, node: Ast.Node.Index) NodeKindError!NodeKind {
     assert(node != 0);
     const nodes_tag: []const Ast.Node.Tag = ast.nodes.items(.tag);
+    const nodes_data: []const Ast.Node.Data = ast.nodes.items(.data);
     return switch (nodes_tag[node]) {
         .array_init_dot_two,
         .array_init_dot_two_comma,
         .array_init_dot,
         .array_init_dot_comma,
+        => .list,
         .array_init,
         .array_init_comma,
-        => .list,
+        => blk: {
+            const data = nodes_data[node];
+            assert(data.lhs != 0); // the doc comment says it can be ommitted, however this never occurs in practice at the time of writing.
+            break :blk error.TypedArrayInit;
+        },
 
-        .struct_init_dot_two,
+        .struct_init_dot_two => blk: {
+            const data = nodes_data[node];
+            if (data.lhs == 0) {
+                assert(data.rhs == 0);
+                break :blk .empty_tuple;
+            }
+            break :blk .record;
+        },
         .struct_init_dot_two_comma,
         .struct_init_dot,
         .struct_init_dot_comma,
+        => .record,
         .struct_init,
         .struct_init_comma,
-        => .record,
+        => blk: {
+            const data = nodes_data[node];
+            assert(data.lhs != 0); // the doc comment says it can be ommitted, however this never occurs in practice at the time of writing.
+            break :blk error.TypedStructInit;
+        },
 
         .negation,
         .number_literal,
@@ -71,10 +92,10 @@ pub fn nodeKind(ast: Ast, node: Ast.Node.Index) NodeKindError!NodeKind {
             }).get(token_slice) orelse error.UnrecognizedIdentifier;
         },
 
-        .block => blk: {
-            const nodes_data: []const Ast.Node.Data = ast.nodes.items(.data);
+        .block_two => blk: {
             const data = nodes_data[node];
-            if (data.lhs != data.rhs) return error.NonEmptyVoidBlock;
+            if (data.lhs != 0) return error.NonEmptyVoidBlock;
+            if (data.rhs != 0) return error.NonEmptyVoidBlock;
             break :blk .void;
         },
 
@@ -82,24 +103,22 @@ pub fn nodeKind(ast: Ast, node: Ast.Node.Index) NodeKindError!NodeKind {
     };
 }
 
-test "null" {
-    const allocator = std.testing.allocator;
-
-    var ast = try Ast.parse(allocator, "null", .zon);
-    defer ast.deinit(allocator);
-
-    const root_expr = rootExpr(ast);
-    try std.testing.expectEqual(.null, nodeKind(ast, root_expr));
+fn testNodeKindSrc(expected: NodeKindError!NodeKind, src: [:0]const u8) !void {
+    var ast = try Ast.parse(std.testing.allocator, src, .zon);
+    defer ast.deinit(std.testing.allocator);
+    return testNodeKindAst(expected, ast, rootExpr(ast));
 }
 
-test "undefined" {
-    const allocator = std.testing.allocator;
+fn testNodeKindAst(expected: NodeKindError!NodeKind, ast: Ast, node: Ast.Node.Index) !void {
+    const actual = nodeKind(ast, node);
+    try std.testing.expectEqual(expected, actual);
+}
 
-    var ast = try Ast.parse(allocator, "undefined", .zon);
-    defer ast.deinit(allocator);
-
-    const root_expr = rootExpr(ast);
-    try std.testing.expectEqual(.undefined, nodeKind(ast, root_expr));
+test "null, undefined, void, & empty tuple" {
+    try testNodeKindSrc(.null, "null");
+    try testNodeKindSrc(.undefined, "undefined");
+    try testNodeKindSrc(.void, "{}");
+    try testNodeKindSrc(.empty_tuple, ".{}");
 }
 
 /// Assumes `nodeKind(ast, node) == .bool`.
@@ -112,6 +131,7 @@ pub fn boolValue(ast: Ast, node: Ast.Node.Index) bool {
 
 /// Assumes `nodeKind(ast, node) == .bool`.
 pub inline fn boolSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
+    assert(nodeKind(ast, node) catch unreachable == .bool);
     return ast.tokenSlice(ast.nodes.items(.main_token)[node]);
 }
 
@@ -137,60 +157,69 @@ test "bool" {
 }
 
 /// Assumes `nodeKind(ast, node) == .number`.
-/// Also see `numberSrc`.
-pub fn numberValue(ast: Ast, node: Ast.Node.Index, comptime T: type) (switch (@typeInfo(T)) {
-    .Int => std.fmt.ParseIntError,
-    .Float => std.fmt.ParseFloatError,
-    else => error{},
-})!T {
-    const src = numberSrc(ast, node);
-    return switch (@typeInfo(T)) {
-        .Int => std.fmt.parseInt(T, src, 0),
-        .Float => std.fmt.parseFloat(T, src),
-        else => @compileError("Expected integer or floating point type, got " ++ @typeName(T)),
-    };
-}
-
-/// Assumes `nodeKind(ast, node) == .number`.
 pub fn numberSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
     assert(nodeKind(ast, node) catch unreachable == .number);
     return ast.getNodeSource(node);
 }
 
 fn testNumberSrc(
-    expected_value: anytype,
     src: [:0]const u8,
 ) !void {
     var ast = try Ast.parse(std.testing.allocator, src, .zon);
     defer ast.deinit(std.testing.allocator);
-    return testNumberAst(expected_value, ast, rootExpr(ast));
+    return testNumberAst(src, ast, rootExpr(ast));
 }
-fn testNumberAst(expected_value: anytype, ast: Ast, node: Ast.Node.Index) !void {
-    try std.testing.expectEqual(.number, nodeKind(ast, node));
-    const ExpectedType = switch (@typeInfo(@TypeOf(expected_value))) {
-        .ComptimeInt => std.math.IntFittingRange(@min(expected_value, 0), @max(0, expected_value)),
-        .ComptimeFloat => f128,
-        .Int, .Float => @TypeOf(expected_value),
-        else => @compileError("Expected integer or float, got " ++ @typeName(@TypeOf(expected_value))),
-    };
-    try std.testing.expectEqual(expected_value, numberValue(ast, node, ExpectedType));
+fn testNumberAst(expected_value: []const u8, ast: Ast, node: Ast.Node.Index) !void {
+    try testNodeKindAst(.number, ast, node);
+    try std.testing.expectEqualStrings(expected_value, numberSrc(ast, node));
 }
 
 test "number" {
-    try testNumberSrc(-34_155, "-34_155");
-    try testNumberSrc(34_155, "34_155");
-    try testNumberSrc(421, "4_2_1");
-    try testNumberSrc(2.3, "2.3");
-    try testNumberSrc(2.3e7, "2.3e7");
-    try testNumberSrc(2.3e-8, "2.3e-8");
-    try testNumberSrc(@as(f16, 2.3e-122), "2.3e-122");
+    try testNumberSrc("-34_155");
+    try testNumberSrc("34_155");
+    try testNumberSrc("4_2_1");
+    try testNumberSrc("2.3");
+    try testNumberSrc("2.3e7");
+    try testNumberSrc("2.3e-8");
+    try testNumberSrc("2.3e-122");
+}
+
+/// Assumes `nodeKind(ast, node) == .err`.
+pub inline fn errValue(ast: Ast, node: Ast.Node.Index, comptime E: type) ?E {
+    const src = errSrc(ast, node);
+    inline for (@typeInfo(E).ErrorSet orelse @compileError("Expected concrete error set, got " ++ @typeName(E))) |err| {
+        if (std.mem.eql(u8, src, err.name)) return @field(E, err.name);
+    }
+    return null;
+}
+
+/// Assumes `nodeKind(ast, node) == .err`.
+pub inline fn errSrc(ast: Ast, node: Ast.Node.Index) []const u8 {
+    assert(nodeKind(ast, node) catch unreachable == .err);
+    const data: Ast.Node.Data = ast.nodes.items(.data)[node];
+    return ast.tokenSlice(data.rhs);
+}
+
+fn testErrSrc(expected: anytype, src: [:0]const u8) !void {
+    var ast = try Ast.parse(std.testing.allocator, src, .zon);
+    defer ast.deinit(std.testing.allocator);
+    return testErrAst(expected, ast, rootExpr(ast));
+}
+fn testErrAst(expected: anytype, ast: Ast, node: Ast.Node.Index) !void {
+    try testNodeKindAst(.err, ast, node);
+    try std.testing.expectEqualStrings(@errorName(expected), errSrc(ast, node));
+    try std.testing.expectEqual(@as(?@TypeOf(expected), expected), errValue(ast, node, @TypeOf(expected)));
+}
+
+test "err" {
+    try testErrSrc(error.Foo, "error.Foo");
+    try testErrSrc(error{ Foo, Bar }.Bar, "error.Bar");
 }
 
 /// Assumes `nodeKind(ast, node) == .enumeration`.
 /// Also see `enumerationSrc`.
-pub fn enumerationValue(ast: Ast, node: Ast.Node.Index, comptime E: type) ?E {
-    const src = enumerationSrc(ast, node);
-    return std.meta.stringToEnum(E, src);
+pub inline fn enumerationValue(ast: Ast, node: Ast.Node.Index, comptime E: type) ?E {
+    return std.meta.stringToEnum(E, enumerationSrc(ast, node));
 }
 
 /// Assumes `nodeKind(ast, node) == .enumeration`.
@@ -206,7 +235,7 @@ fn testEnumerationSrc(expected_value: anytype, src: [:0]const u8) !void {
     return testEnumerationAst(expected_value, ast, rootExpr(ast));
 }
 fn testEnumerationAst(expected_value: anytype, ast: Ast, node: Ast.Node.Index) !void {
-    try std.testing.expectEqual(.enumeration, nodeKind(ast, node));
+    try testNodeKindAst(.enumeration, ast, node);
     const expected_str: []const u8, //
     const already_a_string: bool //
     = switch (@typeInfo(@TypeOf(expected_value))) {
@@ -241,10 +270,11 @@ test "enumeration" {
     try testEnumerationSrc("baz", ".baz");
 }
 
+pub const CharValueError = error{InvalidCharacterLiteral};
 /// Assumes `nodeKind(ast, node) == .char`.
 /// Also see `charSrc` & `charSrcQuoted`.
 /// Returns the unicode point value represented by the character literal.
-pub fn charValue(ast: Ast, node: Ast.Node.Index) error{InvalidCharacterLiteral}!u21 {
+pub fn charValue(ast: Ast, node: Ast.Node.Index) CharValueError!u21 {
     const quoted_src = charSrcQuoted(ast, node);
     const parsed_char_literal = std.zig.parseCharLiteral(quoted_src);
     return switch (parsed_char_literal) {
@@ -277,7 +307,7 @@ fn testCharSrc(expected_value: u21, src: [:0]const u8) !void {
     return testCharAst(expected_value, ast, rootExpr(ast));
 }
 fn testCharAst(expected_value: u21, ast: Ast, node: Ast.Node.Index) !void {
-    try std.testing.expectEqual(.char, nodeKind(ast, node));
+    try testNodeKindAst(.char, ast, node);
     try std.testing.expectEqual(expected_value, charValue(ast, node));
 }
 
@@ -411,10 +441,8 @@ fn testStringViewAst(
     ast: Ast,
     node: Ast.Node.Index,
 ) !void {
-    try std.testing.expectEqual(.string, nodeKind(ast, node));
-
+    try testNodeKindAst(.string, ast, node);
     const sv = StringView.from(ast, node);
-
     var iter = sv.segmentIterator(ast);
 
     var actual_segments = std.ArrayList([]const u8).init(std.testing.allocator);
@@ -481,6 +509,200 @@ test StringView {
     try testStringViewSrc(&.{"foo\\nbar"},
         \\"foo\nbar"
     );
+}
+
+pub const ListView = union(enum) {
+    few: std.BoundedArray(Ast.Node.Index, 2),
+    many: struct { Ast.Node.Index, Ast.Node.Index },
+
+    /// Assumes `nodeKind(ast, node) == .list or nodeKind(ast, node) == .empty_tuple`.
+    pub inline fn from(ast: Ast, node: Ast.Node.Index) ListView {
+        const node_kind = nodeKind(ast, node) catch unreachable;
+        switch (node_kind) {
+            .empty_tuple => return .{ .few = .{} },
+            .list => {},
+            else => unreachable,
+        }
+        const nodes_tag: []const Ast.Node.Tag = ast.nodes.items(.tag);
+        const nodes_data: []const Ast.Node.Data = ast.nodes.items(.data);
+        return switch (nodes_tag[node]) {
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            => blk: {
+                const data = nodes_data[node];
+                assert(data.lhs != 0);
+                var node_list: std.BoundedArray(Ast.Node.Index, 2) = .{};
+                node_list.appendAssumeCapacity(data.lhs);
+                if (data.rhs != 0) node_list.appendAssumeCapacity(data.rhs);
+                break :blk .{ .few = node_list };
+            },
+            .array_init_dot,
+            .array_init_dot_comma,
+            => blk: {
+                const data = nodes_data[node];
+                break :blk .{ data.lhs, data.rhs };
+            },
+            .array_init,
+            .array_init_comma,
+            => unreachable,
+            else => unreachable,
+        };
+    }
+
+    pub inline fn elementNodeList(lv: *const ListView, ast: Ast) []const Ast.Node.Index {
+        return switch (lv.*) {
+            .few => |*barray| barray.constSlice(),
+            .many => |range| blk: {
+                const start, const end = range;
+                break :blk ast.extra_data[start..end];
+            },
+        };
+    }
+};
+
+pub const RecordView = union(enum) {
+    few: std.BoundedArray(Ast.Node.Index, 2),
+    many: struct { Ast.Node.Index, Ast.Node.Index },
+
+    /// Assumes `nodeKind(ast, node) == .record or nodeKind(ast, node) == .empty_tuple`.
+    pub inline fn from(ast: Ast, node: Ast.Node.Index) RecordView {
+        const node_kind = nodeKind(ast, node) catch unreachable;
+        switch (node_kind) {
+            .empty_tuple => return .{ .few = .{} },
+            .record => {},
+            else => unreachable,
+        }
+        const nodes_tag: []const Ast.Node.Tag = ast.nodes.items(.tag);
+        const nodes_data: []const Ast.Node.Data = ast.nodes.items(.data);
+        return switch (nodes_tag[node]) {
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            => blk: {
+                const data = nodes_data[node];
+                assert(data.lhs != 0);
+                var node_list: std.BoundedArray(Ast.Node.Index, 2) = .{};
+                node_list.appendAssumeCapacity(data.lhs);
+                if (data.rhs != 0) node_list.appendAssumeCapacity(data.rhs);
+                break :blk .{ .few = node_list };
+            },
+
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            => blk: {
+                const data = nodes_data[node];
+                break :blk .{ .many = .{ data.lhs, data.rhs } };
+            },
+
+            .struct_init,
+            .struct_init_comma,
+            => unreachable,
+
+            else => unreachable,
+        };
+    }
+
+    pub const Field = struct {
+        name: []const u8,
+        /// The node representing the field value.
+        value: Ast.Node.Index,
+
+        pub inline fn destructure(field: Field) struct { []const u8, Ast.Node.Index } {
+            return .{ field.name, field.value };
+        }
+    };
+
+    pub inline fn fieldCount(rv: *const RecordView) usize {
+        return switch (rv.*) {
+            .few => |barray| barray.len,
+            .many => |range| blk: {
+                const start, const end = range;
+                break :blk end - start;
+            },
+        };
+    }
+
+    /// List of nodes representing each of the record's fields' values.
+    pub inline fn valueNodeList(rv: *const RecordView, ast: Ast) []const Ast.Node.Index {
+        return switch (rv.*) {
+            .few => |*barray| barray.constSlice(),
+            .many => |range| blk: {
+                const start, const end = range;
+                break :blk ast.extra_data[start..end];
+            },
+        };
+    }
+
+    /// Assumes `index < rv.fieldCount()`.
+    pub fn getNameAt(rv: *const RecordView, ast: Ast, index: usize) []const u8 {
+        const node = rv.getValueAt(ast, index);
+        const name_tok = getFieldNameIndexFromValueNode(ast, node);
+        return ast.tokenSlice(name_tok);
+    }
+
+    /// Assumes `index < rv.fieldCount()`.
+    pub inline fn getValueAt(rv: *const RecordView, ast: Ast, index: usize) Ast.Node.Index {
+        return rv.valueNodeList(ast)[index];
+    }
+
+    /// Assumes `index < rv.fieldCount()`.
+    pub inline fn getFieldAt(rv: *const RecordView, ast: Ast, index: usize) Field {
+        return .{
+            .name = rv.getNameAt(ast, index),
+            .value = rv.getValueAt(ast, index),
+        };
+    }
+
+    pub inline fn fieldIterator(rv: *const RecordView, ast: Ast) FieldIterator {
+        return .{
+            .ast = ast,
+            .vnl = rv.valueNodeList(ast),
+            .i = 0,
+        };
+    }
+    pub const FieldIterator = struct {
+        ast: Ast,
+        vnl: []const Ast.Node.Index,
+        i: usize,
+
+        pub inline fn next(iter: *FieldIterator) ?Field {
+            if (iter.i == iter.vnl.len) return null;
+            const value_node = iter.vnl[iter.i];
+            const name_tok = getFieldNameIndexFromValueNode(iter.ast, value_node);
+            return .{
+                .name = iter.ast.tokenSlice(name_tok),
+                .value = value_node,
+            };
+        }
+    };
+
+    fn getFieldNameIndexFromValueNode(ast: Ast, value_node: Ast.Node.Index) Ast.TokenIndex {
+        const first_tok = ast.firstToken(value_node);
+        const eql_tok = first_tok - 1;
+        assert(ast.tokens.items(.tag)[eql_tok] == .equal);
+        const name_tok = eql_tok - 1;
+        return name_tok;
+    }
+};
+
+test RecordView {
+    const allocator = std.testing.allocator;
+
+    var ast = try Ast.parse(allocator, ".{ .foo = 3, .bar = 2.0 }", .zon);
+    defer ast.deinit(allocator);
+
+    const root_expr = rootExpr(ast);
+    try std.testing.expectEqual(.record, nodeKind(ast, root_expr));
+    const rv = RecordView.from(ast, root_expr);
+
+    try std.testing.expectEqual(2, rv.fieldCount());
+    const name1, const value1 = rv.getFieldAt(ast, 0).destructure();
+    const name2, const value2 = rv.getFieldAt(ast, 1).destructure();
+
+    try std.testing.expectEqualStrings("foo", name1);
+    try testNumberAst("3", ast, value1);
+
+    try std.testing.expectEqualStrings("bar", name2);
+    try testNumberAst("2.0", ast, value2);
 }
 
 fn testPrint(comptime fmt: []const u8, args: anytype) void {
